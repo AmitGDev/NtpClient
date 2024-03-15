@@ -24,7 +24,10 @@
 #include <Windows.h>
 #include <cstdint> // For using uint32_t or similar types.
 
-#pragma comment(lib, "Ws2_32.lib") // For NTP client.
+// Functions like WSAStartup, WSACleanup, socket, recv, sendto, etc., are part of the Winsock API.
+// Including Ws2_32.lib ensures that the linker resolves references to these functions and includes
+// them in the final executable.
+#pragma comment(lib, "Ws2_32.lib")
 
 
 namespace // (Anonymous namespace)
