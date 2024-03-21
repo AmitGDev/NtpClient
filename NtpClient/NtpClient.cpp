@@ -62,6 +62,8 @@ namespace // (Anonymous namespace)
             constexpr time_t kSecondsIn24Hours = static_cast<time_t>(60) * 60 * 24, // 60s * 60m * 24h
                 kDaysIn70Years = static_cast<time_t>(365) * 70; // 365d * 70y
 
+            // A leap year is a calendar year with an extra day. 17 leap years between 1900 and 1970:
+            // 1904, 1908, 1912, 1916, 1920, 1924, 1928, 1932, 1936, 1940, 1944, 1948, 1952, 1956, 1960, 1964, 1968
             const time_t time_since_epoch = seconds_ - kSecondsIn24Hours * (kDaysIn70Years + 17) & UINT32_MAX;
 
             return time_since_epoch;
