@@ -315,8 +315,8 @@ namespace ntp_client
                     response.Receive(socket); // <-- RECEIVE
                     time_since_epoch = response.tx_.ToTimeT();
                 }
-            }
-            else {
+
+            } else {
                 [[maybe_unused]] const auto error{ WSAGetLastError() }; // For debug.
             }
         }
