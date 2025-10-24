@@ -1,12 +1,12 @@
 /*
     NtpClient.cpp
-    Copyright (c) 2024, Amit Gefen
+    Copyright (c) 2024-2025, Amit Gefen
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
-    of this software and associated documentation files (the "Software"), to deal
-    in the Software without restriction, including without limitation the rights
-    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-    copies of the Software, and to permit persons to whom the Software is
+    of this software and associated documentation files (the "Software"), to
+    deal in the Software without restriction, including without limitation the
+    rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+    sell copies of the Software, and to permit persons to whom the Software is
     furnished to do so, subject to the following conditions:
 
     The above copyright notice and this permission notice shall be included in
@@ -16,312 +16,465 @@
     IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
     FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
     AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-    THE SOFTWARE.
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+    IN THE SOFTWARE.
 */
 
-#include <Windows.h>
-#include <cstdint> // For using uint32_t or similar types.
+#include "NtpClient.h"
 
-// Functions like WSAStartup, WSACleanup, socket, recv, sendto, etc., are part of the Winsock API.
-// Including Ws2_32.lib ensures that the linker resolves references to these functions and includes
-// them in the final executable.
+#include <winsock2.h>
+#include <ws2tcpip.h>
+// NOLINTNEXTLINE(misc-include-cleaner, llvm-include-order)
+#include <Windows.h>  //  Must be included after Winsock2.h
+
+#include <bit>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <expected>
+#include <memory>
+#include <string>
+#include <system_error>
+#include <utility>
+
 #pragma comment(lib, "Ws2_32.lib")
 
+namespace amitgdev::ntp_client {
 
-namespace // (Anonymous namespace)
-{
+using namespace std::chrono_literals;
 
-    // **** Timestamp class **** 
+namespace {
+// Connection constants
+constexpr uint16_t kNtpPort = 123;
+constexpr auto kDefaultTimeout = 5s;
+constexpr size_t kMaxHostnameLength = 253;
+// NTP Protocol constants
+constexpr uint8_t kDefaultVersion = 3;
+constexpr uint8_t kClientMode = 3;
+constexpr uint8_t kServerMode = 4;
+constexpr uint8_t kAlarmCondition = 3;
+constexpr uint8_t kMaxValidStratum = 15;
+// Leap Indicator Shifts and Masks
+constexpr uint8_t kLeapMask = 0x03;
+constexpr uint8_t kLeapShift = 6;
+constexpr uint8_t kLeapInvMask = 0x3F;
+// Version Shifts and Masks
+constexpr uint8_t kVersionMask = 0x07;
+constexpr uint8_t kVersionShift = 3;
+constexpr uint8_t kVersionInvMask = 0xC7;
+// Mode Shifts and Masks
+constexpr uint8_t kModeMask = 0x07;
+constexpr uint8_t kModeInvMask = 0xF8;
+}  // namespace
 
-    // NTP Fixed-Point Timestamp Format.
-    // Note: RFC 5905 (http://tools.ietf.org/html/rfc5905).
-    class Timestamp final
-    {
-    public:
+// **** Error Handling Implementation ****
 
-        uint32_t seconds_{ 0 }; // Seconds since Jan 1, 1900.
-        uint32_t fraction_{ 0 }; // Fractional part of seconds. Integer number of 2^-32 seconds.
+[[nodiscard]] const char* ErrorCategory::name() const noexcept { return "ntp"; }
 
-
-        // Reverses the Endianness of the timestamp.
-        // Network byte order is big endian, so it needs to be switched before
-        // sending or reading.
-        void ReverseEndian() {
-            ReverseEndianUint32(seconds_);
-            ReverseEndianUint32(fraction_);
-        }
-
-
-        // Convert to time_t.
-        // Returns the integer part of the timestamp in unix time_t format,
-        // which is seconds since Jan 1, 1970.
-        [[nodiscard]] time_t ToTimeT() const
-        {
-            constexpr time_t kSecondsIn24Hours = static_cast<time_t>(60) * 60 * 24, // 60s * 60m * 24h
-                kDaysIn70Years = static_cast<time_t>(365) * 70; // 365d * 70y
-
-            // A leap year is a calendar year with an extra day. 17 leap years between 1900 and 1970:
-            // 1904, 1908, 1912, 1916, 1920, 1924, 1928, 1932, 1936, 1940, 1944, 1948, 1952, 1956, 1960, 1964, 1968
-            const time_t time_since_epoch = seconds_ - kSecondsIn24Hours * (kDaysIn70Years + 17) & UINT32_MAX;
-
-            return time_since_epoch;
-        }
-
-    protected:
-
-        // Reverse the endianness of a 32-bit unsigned integer:
-        void ReverseEndianUint32(uint32_t& x) {
-            x = ((x & 0xFF000000) >> 24) |
-                ((x & 0x00FF0000) >> 8) |
-                ((x & 0x0000FF00) << 8) |
-                ((x & 0x000000FF) << 24);
-        }
-    };
-
-
-    // **** NtpMessage class ****
-
-    // A Network Time Protocol Message.
-    // According to RFC 5905 (http://tools.ietf.org/html/rfc5905).
-    class NtpMessage final
-    {
-    public:
-
-        // The NTP packet header format, depicted in Figure 8 of RFC 5905, is as follows:
-        // 
-        //       0                   1                   2                   3
-        //       0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-        //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-        //      |LI | VN  |Mode |    Stratum     |     Poll      |  Precision   |
-        //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-        //      |                         Root Delay                            |
-        //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-        //      |                         Root Dispersion                       |
-        //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-        //      |                          Reference ID                         |
-        //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-        //      |                                                               |
-        //      +                     Reference Timestamp (64)                  +
-        //      |                                                               |
-        //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-        //      |                                                               |
-        //      +                      Origin Timestamp (64)                    +
-        //      |                                                               |
-        //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-        //      |                                                               |
-        //      +                      Receive Timestamp (64)                   +
-        //      |                                                               |
-        //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-        //      |                                                               |
-        //      +                      Transmit Timestamp (64)                  +
-        //      |                                                               |
-        //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-        //      |                                                               |
-        //      .                                                               .
-        //      .                    Extension Field 1 (variable)               .
-        //      .                                                               .
-        //      |                                                               |
-        //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-        //      |                                                               |
-        //      .                                                               .
-        //      .                    Extension Field 2 (variable)               .
-        //      .                                                               .
-        //      |                                                               |
-        //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-        //      |                          Key Identifier                       |
-        //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-        //      |                                                               |
-        //      |                            dgst (128)                         |
-        //      |                                                               |
-        //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-        //  
-        // The NTP packet header consists of several fields, including Leap Indicator (LI), Version Number (VN), Mode,
-        // Stratum, Poll, Precision, Root Delay, Root Dispersion, Reference ID, Reference Timestamp, Origin Timestamp,
-        // Receive Timestamp, Transmit Timestamp, and Extension Fields.
-
-        uint8_t mode_ : 3;               // (Bit-field: 3 bits) Mode of the message sender. 3 = Client, 4 = Server.
-        uint8_t version_ : 3;            // (Bit-field: 3 bits) Protocol version. Should be set to 4.
-        uint8_t leap_ : 2;               // (Bit-field: 2 bits) Leap seconds warning. See: RFC section 7.3 (http://tools.ietf.org/html/rfc5905#section-7.3).
-
-        uint8_t stratum_{ 0 };           // Servers between client and physical timekeeper. 1 = Server is Connected to Physical Source. 0 = Unknown.
-        uint8_t poll_{ 0 };              // Max Poll Rate. In log2 seconds.
-        uint8_t precision_{ 0 };         // Precision of the clock. In log2 seconds.
-
-        // (^^^ All that above: 4 bytes (32 bits) in total ^^^) 
-
-        uint32_t sync_distance_{ 0 };    // (32 bits in total) Round-trip to reference clock. NTP Short Format.
-        uint32_t drift_rate_{ 0 };       // (32 bits in total) Dispersion to reference clock. NTP Short Format.
-
-        uint8_t ref_clock_id_[4]{ 0 };   // (32 bits in total) Reference ID. For Stratum 1 devices, a 4-byte string. For other devices, 4-byte IP address.
-
-        Timestamp ref_{};                // (64 bits in total) Reference Timestamp. The time when the system clock was last updated.
-        Timestamp orig_{};               // (64 bits in total) Origin Timestamp. Send time of the request. Copied from the request.
-
-        Timestamp rx_{};                 // (64 bits in total) Receive Timestamp. Receive time of the request.
-        Timestamp tx_{};                 // (64 bits in total) Transmit Timestamp. Send time of the response. If only a single time is needed, use this one.
-
-
-        // Constructor:
-        NtpMessage() : mode_(0), version_(0), leap_(0) // C++20 supports initializing the bit-fields in the class definition.
-        {
-
-        }
-
-
-        // Reverses the endianness of all timestamps.
-        // Network byte order is big endian, so they need to be switched before sending and after reading.
-        // Maintaining them in little endian makes them easier to work with locally, though.
-        void ReverseEndian()
-        {
-            ref_.ReverseEndian();
-            orig_.ReverseEndian();
-
-            rx_.ReverseEndian();
-            tx_.ReverseEndian();
-        }
-
-
-        // Receive an NTPMessage.
-        // Return the number of bytes received, 0 on connection gracefully closed.
-        int Receive(SOCKET socket)
-        {
-            // If no error occurs, recv returns the number of bytes received and the buffer pointed to by the buf parameter will contain this data received.
-            // If the connection has been gracefully closed, the return value is zero.
-            int bytes_received = recv(socket, reinterpret_cast<char*>(this), sizeof(*this), 0); // <-- Receives data from a connected socket or a bound connectionless socket.
-
-            ReverseEndian();
-
-            if (bytes_received == SOCKET_ERROR) {
-                [[maybe_unused]] const auto error{ WSAGetLastError() }; // For debug.
-                bytes_received = -1; // Set the return value to -1 to indicate an error.
-            }
-
-            return bytes_received;
-        }
-
-
-        // Send an NTPMessage.
-        // Return the number of bytes sent, 0 on connection gracefully closed, -1 on error.
-        int SendTo(const SOCKET socket, sockaddr_in* server_address)
-        {
-            ReverseEndian();
-
-            // If no error occurs, recv returns the number of bytes received and the buffer pointed to by the buf parameter will contain this data received.
-            // If the connection has been gracefully closed, the return value is zero.
-            // Otherwise, a value of SOCKET_ERROR is returned, and a specific error code can be retrieved by calling WSAGetLastError.
-            int bytes_sent = sendto(socket, reinterpret_cast<const char*>(this), sizeof(*this), 0,
-                reinterpret_cast<sockaddr*>(server_address), sizeof(*server_address)); // <-- Sends data to a specific destination.
-
-            ReverseEndian();
-
-            if (bytes_sent == SOCKET_ERROR) {
-                [[maybe_unused]] const auto error{ WSAGetLastError() }; // For debug.
-                bytes_sent = -1; // Set the return value to -1 to indicate an error.
-            }
-
-            return bytes_sent;
-        }
-    };
-
-
-    // **** WSA class ****
-
-    // RAII wrapper for WSADATA:
-    class WSA final
-    {
-    public:
-
-        // Constructor:
-        WSA()
-        {
-            // Initiates use of the Winsock DLL by a process.
-            // If successful, returns zero.
-            // On error, returns one of few error codes.
-            // Note: An application can call WSAStartup more than once if it needs to obtain the WSADATA structure information more than once.
-            // On each such call, the application can specify any version number (here: 2.2) supported by the Winsock DLL.
-            error_ = WSAStartup(MAKEWORD(2, 2), &data_);
-        }
-
-
-        // Destructor:
-        ~WSA()
-        {
-            // Terminates use of the Winsock 2 DLL (Ws2_32.dll).
-            // The return value is zero if the operation was successful.
-            // On error, the value SOCKET_ERROR is returned, and a specific error number can be retrieved by calling WSAGetLastError().
-            // Attention: In multi-threaded environment, WSACleanup terminates Windows Sockets operations for all threads.
-            if (WSACleanup() == SOCKET_ERROR) {
-                [[maybe_unused]] const auto error{ WSAGetLastError() }; // For debug.
-            }
-        }
-
-
-        // Get Data:
-        const WSADATA& Data() const { return data_; }
-
-
-        // Get Error:
-        const int Error() const { return error_; }
-
-    private:
-
-        WSADATA data_{};
-        int error_{ 0 };
-    };
-
+[[nodiscard]] std::string ErrorCategory::message(const int error_value) const {
+  switch (static_cast<NtpError>(error_value)) {
+    case NtpError::kSuccess:
+      return "Success";
+    case NtpError::kWsaInitFailed:
+      return "WSA initialization failed";
+    case NtpError::kInvalidHostname:
+      return "Invalid hostname";
+    case NtpError::kHostResolutionFailed:
+      return "Host resolution failed";
+    case NtpError::kSocketCreationFailed:
+      return "Socket creation failed";
+    case NtpError::kTimeoutFailed:
+      return "Failed to set socket timeout";
+    case NtpError::kSendFailed:
+      return "Send failed";
+    case NtpError::kReceiveFailed:
+      return "Receive failed";
+    case NtpError::kInvalidResponse:
+      return "Invalid response";
+    default:
+      return "Unknown error";
+  }
 }
 
+const ErrorCategory& GetErrorCategory() noexcept {
+  static const ErrorCategory instance;
+  return instance;
+}
 
-namespace ntp_client
-{
+std::error_code MakeErrorCode(const NtpError ntp_error) noexcept {
+  return {std::to_underlying(ntp_error), GetErrorCategory()};
+}
 
-    // **** GetTime function (Main API) ****
-    // 
-    // Get time from an NTP server.
-    // Return 0 on error.
-    time_t GetTime(const char* hostname) // For examole: Google NTP server (time.google.com).
-    {
-        time_t time_since_epoch{ 0 };
-        WSA wsa{};
+namespace {
+// **** Timestamp class ****
 
-        if (wsa.Error() == 0) {
+// NTP Fixed-Point Timestamp Format.
+// Note: RFC 5905 (http://tools.ietf.org/html/rfc5905).
+class Timestamp final {
+ public:
+  uint32_t seconds_{0};   // Seconds since Jan 1, 1900.
+  uint32_t fraction_{0};  // Fractional part of seconds.
 
-            NtpMessage msg = {}; // Initializes the struct to its default values.
-            // Important, if you don't set the version/mode, the server will ignore you.
-            msg.version_ = 3;
-            msg.mode_ = 3; // Client
+  // Swap the timestamp fields between Network Byte Order
+  // (Big-Endian) and the Host's Native Byte Order. If the
+  // Native Byte Order is Big-Endian (like Network Byte Order),
+  // no operation is performed, as the formats already match.
+  constexpr void SwapEndiansIfNLE() noexcept {
+    if constexpr (std::endian::native == std::endian::little) {
+      seconds_ = std::byteswap(seconds_);
+      fraction_ = std::byteswap(fraction_);
+    }
+  }
 
-            // gethostbyname(name) retrieves host information corresponding to a host name from a host database.
-            // If no error occurs, gethostbyname returns a pointer to the hostent structure. Otherwise, it returns
-            // a null pointer and a specific error number can be retrieved by calling WSAGetLastError().
-            if (const auto host_information = gethostbyname(hostname); host_information != nullptr) {
-                // (on success:)
+  [[nodiscard]] constexpr bool Zero() const noexcept {
+    return seconds_ == 0 && fraction_ == 0;
+  }
+};
 
-                // Converts the (Ipv4) Internet network address into an ASCII string in Internet standard dotted-decimal format:
-                const auto ip = inet_ntoa(*reinterpret_cast<struct in_addr*>(*host_information->h_addr_list));
+// **** NtpMessage class ****
 
-                // Set up the sockaddr_in structure (ref.: https://docs.microsoft.com/en-us/windows/win32/winsock/sockaddr-2):
-                sockaddr_in server_address = {}; // Initializes the struct to its default values.
-                server_address.sin_family = AF_INET; // The AF_INET address family is the address family for IPv4.
-                server_address.sin_addr.s_addr = inet_addr(ip); // Converts a string containing an IPv4 dotted-decimal address into a proper address for the IN_ADDR structure.
-                server_address.sin_port = htons(123); // Converts a u_short from host to TCP/IP network byte order (which is big-endian).
+class NtpMessage final {
+ public:
+  //
+  // The NTP packet header format, depicted in Figure 8 of RFC 5905, is as
+  // follows:
+  //
+  //       0                   1                   2                   3
+  //       0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+  //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  //      |LI | VN  |Mode |    Stratum     |     Poll      |  Precision   |
+  //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  //      |                         Root Delay                            |
+  //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  //      |                         Root Dispersion                       |
+  //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  //      |                          Reference ID                         |
+  //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  //      |                                                               |
+  //      +                     Reference Timestamp (64)                  +
+  //      |                                                               |
+  //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  //      |                                                               |
+  //      +                      Origin Timestamp (64)                    +
+  //      |                                                               |
+  //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  //      |                                                               |
+  //      +                      Receive Timestamp (64)                   +
+  //      |                                                               |
+  //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  //      |                                                               |
+  //      +                      Transmit Timestamp (64)                  +
+  //      |                                                               |
+  //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  //      |                                                               |
+  //      .                                                               .
+  //      .                    Extension Field 1 (variable)               .
+  //      .                                                               .
+  //      |                                                               |
+  //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  //      |                                                               |
+  //      .                                                               .
+  //      .                    Extension Field 2 (variable)               .
+  //      .                                                               .
+  //      |                                                               |
+  //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  //      |                          Key Identifier                       |
+  //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  //      |                                                               |
+  //      |                            dgst (128)                         |
+  //      |                                                               |
+  //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  //
 
-                if (const SOCKET socket = ::socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP); socket != INVALID_SOCKET) { // Creates a UDP socket
-                    msg.SendTo(socket, &server_address); // <-- SEND
+  uint8_t li_vn_mode_{0};
 
-                    NtpMessage response = {}; // Initializes the struct to its default values.
-                    response.Receive(socket); // <-- RECEIVE
-                    time_since_epoch = response.tx_.ToTimeT();
-                }
+  uint8_t stratum_{0};
+  uint8_t poll_{0};
+  uint8_t precision_{0};
 
-            } else {
-                [[maybe_unused]] const auto error{ WSAGetLastError() }; // For debug.
-            }
-        }
+  uint32_t sync_distance_{0};
+  uint32_t drift_rate_{0};
+  uint8_t ref_clock_id_[4]{0};
 
-        return time_since_epoch;
+  Timestamp ref_{};
+  Timestamp orig_{};
+  Timestamp rx_{};
+  Timestamp tx_{};
+
+  constexpr NtpMessage() = default;
+
+  constexpr void SwapEndiansIfNLE() noexcept {
+    ref_.SwapEndiansIfNLE();   // Reference Timestamp (64)
+    orig_.SwapEndiansIfNLE();  // Origin Timestamp (64)
+    rx_.SwapEndiansIfNLE();    // Receive Timestamp (64)
+    tx_.SwapEndiansIfNLE();    // Transmit Timestamp (64)
+
+    // Swap also these fields between Network Byte Order
+    // (Big-Endian) and the Host's Native Byte Order. If the
+    // Native Byte Order is Big-Endian (like Network Byte Order),
+    // no operation is performed, as the formats already match.
+    if constexpr (std::endian::native == std::endian::little) {
+      sync_distance_ = std::byteswap(sync_distance_);
+      drift_rate_ = std::byteswap(drift_rate_);
+    }
+  }
+
+  // Sets the Mode (e.g., 3 for client request).
+  void SetMode(const uint8_t mode) noexcept {
+    li_vn_mode_ = static_cast<uint8_t>(
+        (static_cast<unsigned int>(li_vn_mode_) & kModeInvMask) |
+        (static_cast<unsigned int>(mode) & kModeMask));
+  }
+
+  // Returns the Mode (Provides access for validation,
+  // e.g., checking for Mode 4 server reply).
+  [[nodiscard]] uint8_t Mode() const noexcept {
+    return li_vn_mode_ & kModeMask;
+  }
+
+  // Sets the Version (e.g., 3 or 4).
+  void SetVersion(const uint8_t version) noexcept {
+    li_vn_mode_ = static_cast<uint8_t>(
+        (static_cast<unsigned int>(li_vn_mode_) & kVersionInvMask) |
+        ((static_cast<unsigned int>(version) & kVersionMask) << kVersionShift));
+  }
+
+  // Returns the Version (Provides access for validation/logging).
+  [[nodiscard]] uint8_t Version() const noexcept {
+    return (static_cast<uint8_t>(li_vn_mode_ >> kVersionShift)) & kVersionMask;
+  }
+
+  // Sets the Leap Indicator (e.g., 0 for no warning).
+  void SetLeapIndicator(const uint8_t leap_indicator) noexcept {
+    li_vn_mode_ = static_cast<uint8_t>(
+        (static_cast<unsigned int>(li_vn_mode_) & kLeapInvMask) |
+        ((static_cast<unsigned int>(leap_indicator) & kLeapMask)
+         << kLeapShift));
+  }
+
+  // Returns the Leap Indicator (Provides access for validation, e.g., checking
+  // for alarm condition LI=3).
+  [[nodiscard]] uint8_t LeapIndicator() const noexcept {
+    return (static_cast<uint8_t>(li_vn_mode_ >> kLeapShift)) & kLeapMask;
+  }
+
+  // Validates the NTP response message
+  [[nodiscard]] bool IsValid() const noexcept {
+    return Mode() == kServerMode && LeapIndicator() != kAlarmCondition &&
+           stratum_ > 0 && stratum_ <= kMaxValidStratum && !tx_.Zero();
+  }
+
+  // Receives the NTP message from the given socket
+  // and returns the number of bytes received or an error code.
+  [[nodiscard]] std::expected<int, std::error_code> Receive(
+      const SOCKET socket) noexcept {
+    const auto received_count = recv(socket, reinterpret_cast<char*>(this),
+                                     static_cast<int>(sizeof(*this)), 0);
+
+    if (received_count == SOCKET_ERROR) {
+      return std::unexpected{
+          std::error_code{WSAGetLastError(), std::system_category()}};
     }
 
+    if (received_count < static_cast<int>(sizeof(*this))) {
+      return std::unexpected{MakeErrorCode(NtpError::kInvalidResponse)};
+    }
+
+    // Network Byte Order -> Host Native Byte Order (after reception)
+    SwapEndiansIfNLE();
+
+    return received_count;
+  }
+
+  // Sends the NTP message to the given socket and server address
+  // and returns the number of bytes sent or an error code.
+  [[nodiscard]] std::expected<int, std::error_code> SendTo(
+      const SOCKET socket, const sockaddr_in& server_addr) noexcept {
+    NtpMessage network_msg = *this;
+
+    // Host Native Byte Order -> Network Byte Order (before send)
+    network_msg.SwapEndiansIfNLE();
+
+    const auto sent_count =
+        sendto(socket, reinterpret_cast<const char*>(&network_msg),
+               static_cast<int>(sizeof(network_msg)), 0,
+               reinterpret_cast<const sockaddr*>(&server_addr),
+               static_cast<int>(sizeof(server_addr)));
+
+    if (sent_count == SOCKET_ERROR) {
+      return std::unexpected{
+          std::error_code{WSAGetLastError(), std::system_category()}};
+    }
+
+    return sent_count;
+  }
+};
+
+// **** RAII Socket Wrapper ****
+
+class Socket final {
+ public:
+  explicit Socket(const SOCKET sock = INVALID_SOCKET) noexcept
+      : socket_{sock} {}
+
+  ~Socket() noexcept {
+    if (socket_ != INVALID_SOCKET) {
+      closesocket(socket_);
+    }
+  }
+
+  // Non-copyable
+  Socket(const Socket&) = delete;
+  Socket& operator=(const Socket&) = delete;
+
+  // Move constructor
+  Socket(Socket&& other) noexcept
+      : socket_{std::exchange(other.socket_, INVALID_SOCKET)} {}
+
+  // Move assiggnment operator
+  Socket& operator=(Socket&& other) noexcept {
+    if (this != &other) {
+      if (socket_ != INVALID_SOCKET) {
+        closesocket(socket_);
+      }
+      socket_ = std::exchange(other.socket_, INVALID_SOCKET);
+    }
+    return *this;
+  }
+
+  [[nodiscard]] SOCKET Get() const noexcept { return socket_; }
+  [[nodiscard]] bool Valid() const noexcept {
+    return socket_ != INVALID_SOCKET;
+  }
+
+  [[nodiscard]] explicit operator bool() const noexcept { return Valid(); }
+
+  // Configures send and receive timeouts for Winsock socket
+  [[nodiscard]] bool SetTimeout(
+      std::chrono::milliseconds timeout_ms) const noexcept {
+    // NOLINTNEXTLINE(misc-include-cleaner)
+    const auto timeout = static_cast<DWORD>(timeout_ms.count());
+
+    const auto recv_result =
+        setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+
+    const auto send_result =
+        setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO,
+                   reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+
+    return recv_result != SOCKET_ERROR && send_result != SOCKET_ERROR;
+  }
+
+ private:
+  SOCKET socket_;
+};
+
+// **** RAII Windows Sockets API (WSA) Wrapper ****
+
+class WinsockScope final {
+ public:
+  WinsockScope() noexcept
+      // NOLINTNEXTLINE(misc-include-cleaner)
+      : error_code_(WSAStartup(MAKEWORD(2, 2), &data_)) {}
+
+  ~WinsockScope() noexcept {
+    if (error_code_ == 0) {
+      WSACleanup();
+    }
+  }
+
+  WinsockScope(const WinsockScope&) = delete;
+  WinsockScope& operator=(const WinsockScope&) = delete;
+  WinsockScope(WinsockScope&&) = delete;
+  WinsockScope& operator=(WinsockScope&&) = delete;
+
+  [[nodiscard]] const WSADATA& Data() const noexcept { return data_; }
+  [[nodiscard]] int ErrorCode() const noexcept { return error_code_; }
+  [[nodiscard]] bool Valid() const noexcept { return error_code_ == 0; }
+  [[nodiscard]] explicit operator bool() const noexcept { return Valid(); }
+
+ private:
+  WSADATA data_{};
+  int error_code_{0};
+};
+
+}  // anonymous namespace
+
+// **** Main API ****
+
+[[nodiscard]] std::expected<NtpTimestamp, std::error_code> GetNtpTimestamp(
+    const std::string& hostname) noexcept {
+  if (hostname.empty() || hostname.size() > kMaxHostnameLength) {
+    return std::unexpected{MakeErrorCode(NtpError::kInvalidHostname)};
+  }
+
+  // Initialize Winsock API
+  const WinsockScope windows_sockets_api;
+  if (!windows_sockets_api) {
+    return std::unexpected{MakeErrorCode(NtpError::kWsaInitFailed)};
+  }
+
+  // Prepare NTP request message
+  NtpMessage ntp_message{};
+  ntp_message.SetVersion(kDefaultVersion);
+  ntp_message.SetMode(kClientMode);
+
+  const addrinfo hints{
+      .ai_family = AF_INET,
+      .ai_socktype = SOCK_DGRAM,
+      .ai_protocol = IPPROTO_UDP,
+  };
+
+  // Resolve hostname
+  addrinfo* result = nullptr;
+  if (getaddrinfo(hostname.c_str(), nullptr, &hints, &result) != 0) {
+    return std::unexpected{MakeErrorCode(NtpError::kHostResolutionFailed)};
+  }
+
+  // Ensure addrinfo is freed
+  const std::unique_ptr<addrinfo, decltype(&freeaddrinfo)> addr_guard{
+      result, freeaddrinfo};
+
+  // Validate resolved address
+  if (result == nullptr || result->ai_family != AF_INET) {
+    return std::unexpected{MakeErrorCode(NtpError::kHostResolutionFailed)};
+  }
+
+  // Set server port
+  auto* server_addr = reinterpret_cast<sockaddr_in*>(result->ai_addr);
+  server_addr->sin_port = htons(kNtpPort);
+
+  // Create UDP socket
+  const Socket udp_socket{socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP)};
+  if (!udp_socket) {
+    return std::unexpected{MakeErrorCode(NtpError::kSocketCreationFailed)};
+  }
+
+  // Set socket timeouts
+  if (!udp_socket.SetTimeout(kDefaultTimeout)) {
+    return std::unexpected{MakeErrorCode(NtpError::kTimeoutFailed)};
+  }
+
+  // Send NTP request
+  if (auto send_result = ntp_message.SendTo(udp_socket.Get(), *server_addr);
+      !send_result) {
+    return std::unexpected{MakeErrorCode(NtpError::kSendFailed)};
+  }
+
+  // Receive NTP response
+  NtpMessage response{};
+  if (auto recv_result = response.Receive(udp_socket.Get()); !recv_result) {
+    return std::unexpected{MakeErrorCode(NtpError::kReceiveFailed)};
+  }
+
+  // Validate NTP response
+  if (!response.IsValid()) {
+    return std::unexpected{MakeErrorCode(NtpError::kInvalidResponse)};
+  }
+
+  return NtpTimestamp{response.tx_.seconds_, response.tx_.fraction_};
 }
+
+}  // namespace amitgdev::ntp_client
