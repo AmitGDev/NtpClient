@@ -42,10 +42,10 @@ jobs:
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat"
-          msbuild /m `
-            /p:Configuration=${{ matrix.config }} `
-            /p:Platform=x64 `
-            /p:LanguageStandard=stdcpplatest `
+          msbuild /m ^
+            /p:Configuration=${{ matrix.config }} ^
+            /p:Platform=x64 ^
+            /p:LanguageStandard=stdcpplatest ^
             NtpClient.sln
 
       - name: Perform CodeQL Analysis
