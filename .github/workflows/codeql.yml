@@ -1,4 +1,5 @@
-name: "CodeQL (x64-Debug)"
+name: "CodeQL (x64 Debug & Release)"
+
 on:
   push:
     branches: ["*"]
@@ -10,7 +11,7 @@ on:
 
 jobs:
   analyze:
-    name: Analyze
+    name: Analyze (${{ matrix.config }})
     runs-on: windows-latest
     permissions:
       actions: read
@@ -21,6 +22,7 @@ jobs:
       fail-fast: false
       matrix:
         language: ['cpp']
+        config: ['Debug', 'Release']
 
     steps:
       - name: Checkout repository
@@ -36,11 +38,15 @@ jobs:
         with:
           vs-version: '17.0'
 
-      - name: Build project (C++latest)
+      - name: Build project (${{ matrix.config }}, x64)
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat"
-          msbuild /m /p:Configuration=Debug /p:Platform=x64 /p:LanguageStandard=stdcpplatest NtpClient.sln
+          msbuild /m `
+            /p:Configuration=${{ matrix.config }} `
+            /p:Platform=x64 `
+            /p:LanguageStandard=stdcpplatest `
+            NtpClient.sln
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
